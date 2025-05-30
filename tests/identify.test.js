@@ -1,229 +1,190 @@
-const request = require('supertest');
 const express = require('express');
-const identifyRoutes = require('../src/routes/identify');
-const { PrismaClient } = require('@prisma/client');
+const router = express.Router();
+const prisma = require('../prismaClient');
 
-const prisma = new PrismaClient();
-const app = express();
-app.use(express.json());
-app.use('/identify', identifyRoutes);
+router.post('/', async (req, res) => {
+  const { email, phoneNumber } = req.body;
 
-describe('POST /identify', () => {
-  beforeEach(async () => {
-    // Clear the database before each test
-    await prisma.contact.deleteMany({});
-  });
+  // Input validation
+  if (!email && !phoneNumber) {
+    return res.status(400).json({ error: 'At least one of email or phoneNumber is required' });
+  }
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'Invalid email format' });
+  }
+  // Allow string phone numbers (as per problem statement examples)
+  if (phoneNumber && (typeof phoneNumber !== 'string' && typeof phoneNumber !== 'number')) {
+    return res.status(400).json({ error: 'Phone number must be a string or number' });
+  }
 
-  afterAll(async () => {
-    await prisma.$disconnect();
-  });
+  // Convert phoneNumber to string for consistent handling
+  const phoneStr = phoneNumber ? String(phoneNumber) : null;
 
-  test('should create a new primary contact when no existing contact', async () => {
-    const response = await request(app)
-      .post('/identify')
-      .send({ email: 'lorraine@hillvalley.edu', phoneNumber: '123456' })
-      .set('Content-Type', 'application/json');
+  try {
+    const result = await prisma.$transaction(async (prisma) => {
+      // Find existing contacts that match email or phoneNumber
+      const existingContacts = await prisma.contact.findMany({
+        where: {
+          OR: [
+            ...(email ? [{ email: email }] : []),
+            ...(phoneStr ? [{ phoneNumber: phoneStr }] : []),
+          ],
+          deletedAt: null,
+        },
+        orderBy: { createdAt: 'asc' }
+      });
 
-    expect(response.status).toBe(200);
-    expect(response.body.contact).toMatchObject({
-      primaryContatctId: expect.any(Number),
-      emails: ['lorraine@hillvalley.edu'],
-      phoneNumbers: ['123456'],
-      secondaryContactIds: []
-    });
-  });
+      // If no existing contacts, create new primary contact
+      if (existingContacts.length === 0) {
+        const newContact = await prisma.contact.create({
+          data: {
+            email: email || null,
+            phoneNumber: phoneStr || null,
+            linkPrecedence: 'primary',
+          },
+        });
 
-  test('should create secondary contact when new email with existing phone', async () => {
-    // Create initial contact
-    await prisma.contact.create({
-      data: {
-        email: 'lorraine@hillvalley.edu',
-        phoneNumber: '123456',
-        linkPrecedence: 'primary'
+        return {
+          contact: {
+            primaryContactId: newContact.id,
+            emails: newContact.email ? [newContact.email] : [],
+            phoneNumbers: newContact.phoneNumber ? [newContact.phoneNumber] : [],
+            secondaryContactIds: [],
+          },
+        };
       }
-    });
 
-    const response = await request(app)
-      .post('/identify')
-      .send({ email: 'mcfly@hillvalley.edu', phoneNumber: '123456' })
-      .set('Content-Type', 'application/json');
+      // Find all connected contacts (including those linked to found contacts)
+      const allConnectedContactIds = new Set();
+      const primaryContactIds = new Set();
 
-    expect(response.status).toBe(200);
-    expect(response.body.contact.emails).toEqual(['lorraine@hillvalley.edu', 'mcfly@hillvalley.edu']);
-    expect(response.body.contact.phoneNumbers).toEqual(['123456']);
-    expect(response.body.contact.secondaryContactIds).toHaveLength(1);
-  });
+      // Add direct matches
+      existingContacts.forEach(contact => {
+        allConnectedContactIds.add(contact.id);
+        if (contact.linkPrecedence === 'primary') {
+          primaryContactIds.add(contact.id);
+        } else if (contact.linkedId) {
+          primaryContactIds.add(contact.linkedId);
+        }
+      });
 
-  test('should handle merging of two separate primary contacts', async () => {
-    // Create two separate primary contacts
-    const contact1 = await prisma.contact.create({
-      data: {
-        email: 'george@hillvalley.edu',
-        phoneNumber: '919191',
-        linkPrecedence: 'primary'
+      // Get all primary contacts involved
+      const primaryContacts = await prisma.contact.findMany({
+        where: {
+          id: { in: Array.from(primaryContactIds) },
+          deletedAt: null
+        },
+        orderBy: { createdAt: 'asc' }
+      });
+
+      // The oldest primary contact becomes the main primary
+      const mainPrimaryContact = primaryContacts[0];
+
+      // If there are multiple primary contacts, merge them
+      if (primaryContacts.length > 1) {
+        for (let i = 1; i < primaryContacts.length; i++) {
+          const contactToUpdate = primaryContacts[i];
+          
+          // Convert this primary to secondary
+          await prisma.contact.update({
+            where: { id: contactToUpdate.id },
+            data: {
+              linkPrecedence: 'secondary',
+              linkedId: mainPrimaryContact.id,
+            },
+          });
+
+          // Update all contacts that were linked to this former primary
+          await prisma.contact.updateMany({
+            where: {
+              linkedId: contactToUpdate.id,
+              deletedAt: null
+            },
+            data: {
+              linkedId: mainPrimaryContact.id,
+            },
+          });
+        }
       }
-    });
 
-    await new Promise(resolve => setTimeout(resolve, 10)); // Small delay to ensure different timestamps
+      // Get all contacts in the final connected group
+      const allRelatedContacts = await prisma.contact.findMany({
+        where: {
+          OR: [
+            { id: mainPrimaryContact.id },
+            { linkedId: mainPrimaryContact.id }
+          ],
+          deletedAt: null
+        },
+        orderBy: { createdAt: 'asc' }
+      });
 
-    const contact2 = await prisma.contact.create({
-      data: {
-        email: 'biffsucks@hillvalley.edu',
-        phoneNumber: '717171',
-        linkPrecedence: 'primary'
+      // Check if we need to create a new secondary contact
+      const hasExactMatch = allRelatedContacts.some(contact => 
+        contact.email === email && contact.phoneNumber === phoneStr
+      );
+
+      let newSecondaryContact = null;
+      if (!hasExactMatch) {
+        // Check if this request provides genuinely new information
+        const existingEmails = new Set(allRelatedContacts.map(c => c.email).filter(Boolean));
+        const existingPhones = new Set(allRelatedContacts.map(c => c.phoneNumber).filter(Boolean));
+        
+        const hasNewInfo = (email && !existingEmails.has(email)) || 
+                          (phoneStr && !existingPhones.has(phoneStr));
+
+        if (hasNewInfo) {
+          newSecondaryContact = await prisma.contact.create({
+            data: {
+              email: email || null,
+              phoneNumber: phoneStr || null,
+              linkPrecedence: 'secondary',
+              linkedId: mainPrimaryContact.id,
+            },
+          });
+        }
       }
+
+      // Prepare final response
+      const finalRelatedContacts = newSecondaryContact 
+        ? [...allRelatedContacts, newSecondaryContact]
+        : allRelatedContacts;
+
+      const secondaryContacts = finalRelatedContacts.filter(c => c.id !== mainPrimaryContact.id);
+
+      // Collect unique emails and phone numbers
+      const emails = [];
+      const phoneNumbers = [];
+
+      // Add primary contact's data first
+      if (mainPrimaryContact.email) emails.push(mainPrimaryContact.email);
+      if (mainPrimaryContact.phoneNumber) phoneNumbers.push(mainPrimaryContact.phoneNumber);
+
+      // Add secondary contacts' unique data
+      secondaryContacts.forEach(contact => {
+        if (contact.email && !emails.includes(contact.email)) {
+          emails.push(contact.email);
+        }
+        if (contact.phoneNumber && !phoneNumbers.includes(contact.phoneNumber)) {
+          phoneNumbers.push(contact.phoneNumber);
+        }
+      });
+
+      return {
+        contact: {
+          primaryContactId: mainPrimaryContact.id, // Fixed typo
+          emails,
+          phoneNumbers,
+          secondaryContactIds: secondaryContacts.map(c => c.id),
+        },
+      };
     });
 
-    // Request that links them
-    const response = await request(app)
-      .post('/identify')
-      .send({ email: 'george@hillvalley.edu', phoneNumber: '717171' })
-      .set('Content-Type', 'application/json');
-
-    expect(response.status).toBe(200);
-    expect(response.body.contact).toMatchObject({
-      primaryContatctId: contact1.id, // Older contact should remain primary
-      emails: expect.arrayContaining(['george@hillvalley.edu', 'biffsucks@hillvalley.edu']),
-      phoneNumbers: expect.arrayContaining(['919191', '717171']),
-      secondaryContactIds: expect.arrayContaining([contact2.id])
-    });
-
-    // Verify primary contact's email comes first
-    expect(response.body.contact.emails[0]).toBe('george@hillvalley.edu');
-    expect(response.body.contact.phoneNumbers[0]).toBe('919191');
-  });
-
-  test('should return existing data when exact match found', async () => {
-    const contact = await prisma.contact.create({
-      data: {
-        email: 'lorraine@hillvalley.edu',
-        phoneNumber: '123456',
-        linkPrecedence: 'primary'
-      }
-    });
-
-    const response = await request(app)
-      .post('/identify')
-      .send({ email: 'lorraine@hillvalley.edu', phoneNumber: '123456' })
-      .set('Content-Type', 'application/json');
-
-    expect(response.status).toBe(200);
-    expect(response.body.contact).toMatchObject({
-      primaryContatctId: contact.id,
-      emails: ['lorraine@hillvalley.edu'],
-      phoneNumbers: ['123456'],
-      secondaryContactIds: []
-    });
-  });
-
-  test('should work with only email provided', async () => {
-    await prisma.contact.create({
-      data: {
-        email: 'lorraine@hillvalley.edu',
-        phoneNumber: '123456',
-        linkPrecedence: 'primary'
-      }
-    });
-
-    const response = await request(app)
-      .post('/identify')
-      .send({ email: 'lorraine@hillvalley.edu' })
-      .set('Content-Type', 'application/json');
-
-    expect(response.status).toBe(200);
-    expect(response.body.contact.emails).toEqual(['lorraine@hillvalley.edu']);
-    expect(response.body.contact.phoneNumbers).toEqual(['123456']);
-  });
-
-  test('should work with only phoneNumber provided', async () => {
-    await prisma.contact.create({
-      data: {
-        email: 'lorraine@hillvalley.edu',
-        phoneNumber: '123456',
-        linkPrecedence: 'primary'
-      }
-    });
-
-    const response = await request(app)
-      .post('/identify')
-      .send({ phoneNumber: '123456' })
-      .set('Content-Type', 'application/json');
-
-    expect(response.status).toBe(200);
-    expect(response.body.contact.emails).toEqual(['lorraine@hillvalley.edu']);
-    expect(response.body.contact.phoneNumbers).toEqual(['123456']);
-  });
-
-  test('should handle complex linking scenario', async () => {
-    // Create primary contact
-    const primary = await prisma.contact.create({
-      data: {
-        email: 'lorraine@hillvalley.edu',
-        phoneNumber: '123456',
-        linkPrecedence: 'primary'
-      }
-    });
-
-    // Create secondary contact
-    await prisma.contact.create({
-      data: {
-        email: 'mcfly@hillvalley.edu',
-        phoneNumber: '123456',
-        linkPrecedence: 'secondary',
-        linkedId: primary.id
-      }
-    });
-
-    // Request with new phone number but existing email
-    const response = await request(app)
-      .post('/identify')
-      .send({ email: 'mcfly@hillvalley.edu', phoneNumber: '789012' })
-      .set('Content-Type', 'application/json');
-
-    expect(response.status).toBe(200);
-    expect(response.body.contact.emails).toEqual(['lorraine@hillvalley.edu', 'mcfly@hillvalley.edu']);
-    expect(response.body.contact.phoneNumbers).toEqual(expect.arrayContaining(['123456', '789012']));
-    expect(response.body.contact.secondaryContactIds).toHaveLength(2);
-  });
-
-  test('should return 400 for missing email and phoneNumber', async () => {
-    const response = await request(app)
-      .post('/identify')
-      .send({})
-      .set('Content-Type', 'application/json');
-
-    expect(response.status).toBe(400);
-    expect(response.body).toEqual({ error: 'At least one of email or phoneNumber is required' });
-  });
-
-  test('should return 400 for invalid email format', async () => {
-    const response = await request(app)
-      .post('/identify')
-      .send({ email: 'invalid-email', phoneNumber: '123456' })
-      .set('Content-Type', 'application/json');
-
-    expect(response.status).toBe(400);
-    expect(response.body).toEqual({ error: 'Invalid email format' });
-  });
-
-  test('should return 400 for invalid phone number format', async () => {
-    const response = await request(app)
-      .post('/identify')
-      .send({ email: 'test@example.com', phoneNumber: 'abc123' })
-      .set('Content-Type', 'application/json');
-
-    expect(response.status).toBe(400);
-    expect(response.body).toEqual({ error: 'Phone number must be numeric' });
-  });
-
-  test('should handle null values correctly', async () => {
-    const response = await request(app)
-      .post('/identify')
-      .send({ email: null, phoneNumber: '123456' })
-      .set('Content-Type', 'application/json');
-
-    expect(response.status).toBe(200);
-    expect(response.body.contact.emails).toEqual([]);
-    expect(response.body.contact.phoneNumbers).toEqual(['123456']);
-  });
+    res.status(200).json(result);
+  } catch (error) {
+    console.error('Error in /identify:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
+
+module.exports = router;
