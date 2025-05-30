@@ -1,95 +1,139 @@
 const express = require('express');
 const router = express.Router();
+const prisma = require('../prismaClient');
 
-// In-memory storage
-let contacts = [];
-let nextId = 1;
-
-router.post('/', (req, res) => {
+// POST /identify endpoint to reconcile customer identities
+router.post('/', async (req, res) => {
   const { email, phoneNumber } = req.body;
 
-  // Validation
+  // Input validation: Ensure at least one of email or phoneNumber is provided
   if (!email && !phoneNumber) {
-    return res.status(400).json({ error: 'At least one contact info required' });
+    return res.status(400).json({ error: 'At least one of email or phoneNumber is required' });
+  }
+
+  // Validate email format if provided
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'Invalid email format' });
+  }
+
+  // Validate phoneNumber is numeric if provided
+  if (phoneNumber && !/^\d+$/.test(phoneNumber)) {
+    return res.status(400).json({ error: 'Phone number must be numeric' });
   }
 
   try {
-    // Find matching contacts (email OR phone)
-    const matches = contacts.filter(c => 
-      (email && c.email === email) || 
-      (phoneNumber && c.phoneNumber === phoneNumber)
-    );
-
-    // Case 1: No matches → create primary
-    if (matches.length === 0) {
-      const newContact = {
-        id: nextId++,
-        email,
-        phoneNumber,
-        linkPrecedence: 'primary',
-        linkedId: null,
-        createdAt: new Date()
-      };
-      contacts.push(newContact);
-      
-      return res.json({
-        contact: {
-          primaryContatctId: newContact.id,
-          emails: [newContact.email].filter(Boolean),
-          phoneNumbers: [newContact.phoneNumber].filter(Boolean),
-          secondaryContactIds: []
-        }
+    // Use Prisma transaction to ensure atomicity
+    const result = await prisma.$transaction(async (prisma) => {
+      // Find existing contacts matching either email or phoneNumber (and not deleted)
+      const existingContacts = await prisma.contact.findMany({
+        where: {
+          OR: [
+            { email: email || null },
+            { phoneNumber: phoneNumber || null },
+          ],
+          deletedAt: null,
+        },
       });
-    }
 
-    // Find primary contact (oldest match)
-    const primary = matches.reduce((oldest, current) => 
-      current.createdAt < oldest.createdAt ? current : oldest
-    );
+      let primaryContact = null;
+      let secondaryContacts = [];
 
-    // Check if new info needs to be added
-    const hasNewInfo = (
-      (email && !contacts.some(c => c.email === email)) ||
-      (phoneNumber && !contacts.some(c => c.phoneNumber === phoneNumber))
-    );
+      // Case 1: No existing contacts - create a new primary contact
+      if (existingContacts.length === 0) {
+        primaryContact = await prisma.contact.create({
+          data: {
+            email,
+            phoneNumber,
+            linkPrecedence: 'primary',
+          },
+        });
+      } else {
+        // Find the primary contact (earliest created with linkPrecedence: "primary")
+        primaryContact = existingContacts.reduce((earliest, contact) => {
+          if (contact.linkPrecedence === 'primary' && (!earliest || contact.createdAt < earliest.createdAt)) {
+            return contact;
+          }
+          return earliest || contact;
+        }, null);
 
-    if (hasNewInfo) {
-      const newSecondary = {
-        id: nextId++,
-        email,
-        phoneNumber,
-        linkPrecedence: 'secondary',
-        linkedId: primary.id,
-        createdAt: new Date()
-      };
-      contacts.push(newSecondary);
-    }
+        // Handle other contacts: merge primaries or link secondaries
+        const otherContacts = existingContacts.filter(c => c.id !== primaryContact.id);
+        for (const contact of otherContacts) {
+          if (contact.linkPrecedence === 'primary') {
+            // If another primary is found, demote it to secondary and link to the earliest primary
+            await prisma.contact.update({
+              where: { id: contact.id },
+              data: {
+                linkPrecedence: 'secondary',
+                linkedId: primaryContact.id,
+              },
+            });
+            secondaryContacts.push(contact.id);
+          } else {
+            // Already a secondary contact, just add its ID to the list
+            secondaryContacts.push(contact.id);
+          }
+        }
 
-    // Get all linked contacts
-    const allLinked = contacts.filter(c => 
-      c.id === primary.id || c.linkedId === primary.id
-    );
-
-    // Prepare response
-    const secondaryContacts = allLinked.filter(c => c.id !== primary.id);
-    
-    res.json({
-      contact: {
-        primaryContatctId: primary.id,
-        emails: Array.from(new Set([
-          primary.email,
-          ...secondaryContacts.map(c => c.email)
-        ].filter(Boolean))),
-        phoneNumbers: Array.from(new Set([
-          primary.phoneNumber,
-          ...secondaryContacts.map(c => c.phoneNumber)
-        ].filter(Boolean))),
-        secondaryContactIds: secondaryContacts.map(c => c.id)
+        // Check if the request contains new data (new combination of email/phoneNumber)
+        const hasNewData = !existingContacts.some(c => c.email === email && c.phoneNumber === phoneNumber);
+        if (hasNewData) {
+          // Create a new secondary contact if the combination is new
+          const newContact = await prisma.contact.create({
+            data: {
+              email,
+              phoneNumber,
+              linkPrecedence: 'secondary',
+              linkedId: primaryContact.id,
+            },
+          });
+          secondaryContacts.push(newContact.id);
+        }
       }
+
+      // Fetch all related contacts (primary and its secondaries) for the response
+      const relatedContacts = await prisma.contact.findMany({
+        where: {
+          OR: [
+            { id: primaryContact.id },
+            { linkedId: primaryContact.id },
+          ],
+          deletedAt: null,
+        },
+      });
+
+      // Prepare the response: consolidate emails, phone numbers, and secondary IDs
+      const emails = [...new Set(relatedContacts.map(c => c.email).filter(e => e))];
+      const phoneNumbers = [...new Set(relatedContacts.map(c => c.phoneNumber).filter(p => p))];
+      const secondaryContactIds = relatedContacts
+        .filter(c => c.id !== primaryContact.id)
+        .map(c => c.id);
+
+      // Ensure primary contact's email and phone number are first in their arrays
+      if (primaryContact.email) {
+        emails.splice(emails.indexOf(primaryContact.email), 1);
+        emails.unshift(primaryContact.email);
+      }
+      if (primaryContact.phoneNumber) {
+        phoneNumbers.splice(phoneNumbers.indexOf(primaryContact.phoneNumber), 1);
+        phoneNumbers.unshift(primaryContact.phoneNumber);
+      }
+
+      return {
+        contact: {
+          primaryContactId: primaryContact.id, // Fixed typo: primaryContatctId -> primaryContactId
+          emails,
+          phoneNumbers,
+          secondaryContactIds,
+        },
+      };
     });
 
+    // Return the response with HTTP 200 status
+    res.status(200).json(result);
   } catch (error) {
-    console.error(error);
+    // Handle any errors during processing
+    console.error('Error in /identify:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
