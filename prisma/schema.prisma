@@ -11,13 +11,14 @@ model Contact {
   id             Int       @id @default(autoincrement())
   phoneNumber    String?
   email          String?
-  linkedId       Int?      @map("linkedId")
-  linkPrecedence String    @default("primary") // "primary" or "secondary"
+  linkedId       Int?
+  linkPrecedence String    @default("primary")
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
   deletedAt      DateTime?
 
   @@index([email])
   @@index([phoneNumber])
+  @@index([linkedId])
   @@map("Contact")
 }
