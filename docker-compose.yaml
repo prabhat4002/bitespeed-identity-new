@@ -1,0 +1,26 @@
+services:
+  app:
+    build: .
+    container_name: bitespeed-app
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/bitespeed
+      - NODE_ENV=development
+      - PORT=5003
+    ports:
+      - "5003:5003"
+    depends_on:
+      - db
+    command: sh -c "npx prisma generate && npx prisma migrate deploy && node ./src/server.js"
+  db:
+    image: postgres:13-alpine
+    container_name: bitespeed-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: bitespeed
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+volumes:
+  postgres-data:
