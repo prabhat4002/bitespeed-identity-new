@@ -34,7 +34,6 @@ router.post('/', async (req, res) => {
           deletedAt: null,
         },
       });
-      console.log('Existing contacts:', existingContacts); // Debug log
 
       let primaryContact = null;
       let secondaryContacts = [];
@@ -56,7 +55,6 @@ router.post('/', async (req, res) => {
           }
           return earliest || contact;
         }, null);
-        console.log('Primary contact:', primaryContact); // Debug log
 
         // Handle other contacts: merge primaries or link secondaries
         const otherContacts = existingContacts.filter(c => c.id !== primaryContact.id);
@@ -78,11 +76,7 @@ router.post('/', async (req, res) => {
         }
 
         // Check if the request contains new data (new combination of email/phoneNumber)
-        const hasNewData = !existingContacts.some(c => 
-          (email && c.email === email) && 
-          (phoneNumber === null ? c.phoneNumber === null : c.phoneNumber === phoneNumber)
-        );
-        console.log('hasNewData:', hasNewData, 'Input:', { email, phoneNumber }); // Debug log
+        const hasNewData = !existingContacts.some(c => c.email === email && c.phoneNumber === phoneNumber);
         if (hasNewData) {
           // Create a new secondary contact if the combination is new
           const newContact = await prisma.contact.create({
@@ -145,8 +139,8 @@ router.post('/', async (req, res) => {
     res.status(200).json(result);
   } catch (error) {
     // Handle any errors during processing
-    console.error('Error in /identify:', error.message, error.stack);
-    res.status(500).json({ error: 'Internal server error', details: error.message });
+    console.error('Error in /identify:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
