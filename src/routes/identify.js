@@ -19,7 +19,8 @@ router.post('/', async (req, res) => {
 
   try {
     const result = await prisma.$transaction(async (prisma) => {
-      const existingContacts = await prisma.contact.findMany({
+      // Step 1: Find initial matching contacts
+      let initialMatches = await prisma.contact.findMany({
         where: {
           OR: [
             { email: email || null },
@@ -28,12 +29,35 @@ router.post('/', async (req, res) => {
           deletedAt: null,
         },
       });
+      console.log('Initial matches:', initialMatches);
+
+      // Step 2: Find the primary contact by following linkedId
+      let primaryContactId = null;
+      if (initialMatches.length > 0) {
+        const firstMatch = initialMatches[0];
+        primaryContactId = firstMatch.linkPrecedence === 'primary' ? firstMatch.id : firstMatch.linkedId;
+      }
+
+      // Step 3: Fetch all related contacts (primary and its secondaries)
+      let existingContacts = [];
+      if (primaryContactId) {
+        existingContacts = await prisma.contact.findMany({
+          where: {
+            OR: [
+              { id: primaryContactId },
+              { linkedId: primaryContactId },
+            ],
+            deletedAt: null,
+          },
+        });
+      }
       console.log('Existing contacts:', existingContacts);
 
       let primaryContact = null;
       let secondaryContacts = [];
 
       if (existingContacts.length === 0) {
+        // Case 1: No existing contacts - create a new primary contact
         primaryContact = await prisma.contact.create({
           data: {
             email,
@@ -42,14 +66,11 @@ router.post('/', async (req, res) => {
           },
         });
       } else {
-        primaryContact = existingContacts.reduce((earliest, contact) => {
-          if (contact.linkPrecedence === 'primary' && (!earliest || contact.createdAt < earliest.createdAt)) {
-            return contact;
-          }
-          return earliest || contact;
-        }, null);
+        // Find the primary contact (should be the one with linkPrecedence: "primary")
+        primaryContact = existingContacts.find(c => c.linkPrecedence === 'primary');
         console.log('Primary contact:', primaryContact);
 
+        // Handle other contacts: merge primaries or link secondaries
         const otherContacts = existingContacts.filter(c => c.id !== primaryContact.id);
         for (const contact of otherContacts) {
           if (contact.linkPrecedence === 'primary') {
@@ -66,6 +87,7 @@ router.post('/', async (req, res) => {
           }
         }
 
+        // Check if the request contains new data (new email not already in the group)
         const hasNewData = email && !existingContacts.some(c => c.email === email);
         console.log('hasNewData:', hasNewData, 'Input:', { email, phoneNumber });
 
@@ -82,6 +104,7 @@ router.post('/', async (req, res) => {
         }
       }
 
+      // Fetch all related contacts for the response
       const relatedContacts = await prisma.contact.findMany({
         where: {
           OR: [
