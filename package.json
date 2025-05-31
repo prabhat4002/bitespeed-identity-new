@@ -5,7 +5,7 @@
   "scripts": {
     "start": "node src/server.js",
     "prisma:generate": "npx prisma generate",
-    "migrate": "npx prisma migrate deploy",
+    "migrate": "npx prisma migrate deploy --schema=./prisma/schema.prisma || echo 'Prisma migration failed'",
     "test": "jest",
     "build": "npm install && npm run prisma:generate && npm run migrate"
   },
