@@ -9,17 +9,26 @@ router.post('/', async (req, res) => {
     return res.status(400).json({ error: 'At least one of email or phoneNumber is required' });
   }
 
-  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    return res.status(400).json({ error: 'Invalid email format' });
+  if (email) {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+    if (email.length > 255) {
+      return res.status(400).json({ error: 'Email must not exceed 255 characters' });
+    }
   }
 
-  if (phoneNumber && !/^\d+$/.test(phoneNumber)) {
-    return res.status(400).json({ error: 'Phone number must be numeric' });
+  if (phoneNumber) {
+    if (!/^\d+$/.test(phoneNumber)) {
+      return res.status(400).json({ error: 'Phone number must be numeric' });
+    }
+    if (phoneNumber.length > 20) {
+      return res.status(400).json({ error: 'Phone number must not exceed 20 digits' });
+    }
   }
 
   try {
     const result = await prisma.$transaction(async (prisma) => {
-      // Step 1: Find initial matching contacts
       let initialMatches = await prisma.contact.findMany({
         where: {
           OR: [
@@ -31,14 +40,12 @@ router.post('/', async (req, res) => {
       });
       console.log('Initial matches:', initialMatches);
 
-      // Step 2: Find the primary contact by following linkedId
       let primaryContactId = null;
       if (initialMatches.length > 0) {
         const firstMatch = initialMatches[0];
         primaryContactId = firstMatch.linkPrecedence === 'primary' ? firstMatch.id : firstMatch.linkedId;
       }
 
-      // Step 3: Fetch all related contacts (primary and its secondaries)
       let existingContacts = [];
       if (primaryContactId) {
         existingContacts = await prisma.contact.findMany({
@@ -57,7 +64,6 @@ router.post('/', async (req, res) => {
       let secondaryContacts = [];
 
       if (existingContacts.length === 0) {
-        // Case 1: No existing contacts - create a new primary contact
         primaryContact = await prisma.contact.create({
           data: {
             email,
@@ -66,11 +72,9 @@ router.post('/', async (req, res) => {
           },
         });
       } else {
-        // Find the primary contact (should be the one with linkPrecedence: "primary")
         primaryContact = existingContacts.find(c => c.linkPrecedence === 'primary');
         console.log('Primary contact:', primaryContact);
 
-        // Handle other contacts: merge primaries or link secondaries
         const otherContacts = existingContacts.filter(c => c.id !== primaryContact.id);
         for (const contact of otherContacts) {
           if (contact.linkPrecedence === 'primary') {
@@ -87,8 +91,9 @@ router.post('/', async (req, res) => {
           }
         }
 
-        // Check if the request contains new data (new email not already in the group)
-        const hasNewData = email && !existingContacts.some(c => c.email === email);
+        const hasNewData =
+          (email && !existingContacts.some(c => c.email === email)) ||
+          (phoneNumber && !existingContacts.some(c => c.phoneNumber === phoneNumber));
         console.log('hasNewData:', hasNewData, 'Input:', { email, phoneNumber });
 
         if (hasNewData) {
@@ -104,7 +109,6 @@ router.post('/', async (req, res) => {
         }
       }
 
-      // Fetch all related contacts for the response
       const relatedContacts = await prisma.contact.findMany({
         where: {
           OR: [
