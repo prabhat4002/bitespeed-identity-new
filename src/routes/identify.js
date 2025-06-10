@@ -125,15 +125,15 @@ const identify = async (req, res) => {
         }
       }
 
-      // Check if the new email/phoneNumber pair needs a new secondary contact
+      // Check if the new email/phoneNumber pair provides new information
       const allEmails = new Set([...primaryContacts.map(c => c.email), ...secondaryContacts.map(c => c.email)].filter(Boolean));
       const allPhoneNumbers = new Set([...primaryContacts.map(c => c.phoneNumber), ...secondaryContacts.map(c => c.phoneNumber)].filter(Boolean));
 
-      const emailExists = email && allEmails.has(email);
-      const phoneExists = phoneNumber && allPhoneNumbers.has(phoneNumber);
+      const emailIsNew = email && !allEmails.has(email);
+      const phoneIsNew = phoneNumber && !allPhoneNumbers.has(phoneNumber);
 
-      if (!(emailExists && phoneExists)) {
-        // Create a new secondary contact if the email/phone pair is new
+      // Only create a new contact if there's new information to add
+      if (emailIsNew || phoneIsNew) {
         await tx.contact.create({
           data: {
             email,
