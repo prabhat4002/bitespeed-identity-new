@@ -1,5 +1,9 @@
+const express = require('express');
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
+
+// Create an Express Router
+const router = express.Router();
 
 // Validation regex
 const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -174,4 +178,8 @@ const identify = async (req, res) => {
   }
 };
 
+// Define the POST route for /identify
+router.post('/', identify);
+
+// Export the router for use in server.js with app.use('/identify', identifyRoutes)
 module.exports = router;
